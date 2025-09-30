@@ -1,61 +1,17 @@
-# champions_app.py
-# Streamlit-App zur Berechnung der Champions-Scores (GeoPAK10 + Buffett-Kriterien)
-
 import streamlit as st
 import pandas as pd
 import numpy as np
 import yfinance as yf
-import time
-from datetime import datetime, timedelta
+from datetime import datetime
 
-st.set_page_config(page_title="Champions Auswahl", page_icon="🏆", layout="wide")
+st.set_page_config(page_title="Champions App – GeoPAK10 & Buffett", page_icon="🏆", layout="wide")
 
-# ------------------------------------------------------
+# ----------------------------
 # Hilfsfunktionen
-# ------------------------------------------------------
-
-def fetch_ohlc_safe(ticker_list, start, end, batch_size=20, pause=1):
-    """Lädt Kursdaten in Batches, um Rate Limits von yfinance zu vermeiden."""
-    all_prices = []
-    failed = []
-
-    for i in range(0, len(ticker_list), batch_size):
-        batch = ticker_list[i:i+batch_size]
-        try:
-            data = yf.download(
-                tickers=" ".join(batch),
-                start=start,
-                end=end,
-                group_by="ticker",
-                auto_adjust=False,
-                progress=False,
-                threads=True,
-            )
-            if isinstance(data.columns, pd.MultiIndex):
-                for t in batch:
-                    try:
-                        closes = data[t]["Adj Close"].rename(t)
-                        all_prices.append(closes)
-                    except Exception:
-                        failed.append(t)
-            else:
-                closes = data["Adj Close"].rename(batch[0])
-                all_prices.append(closes)
-        except Exception:
-            failed.extend(batch)
-
-        time.sleep(pause)
-
-    if all_prices:
-        prices = pd.concat(all_prices, axis=1).dropna(how="all")
-    else:
-        prices = pd.DataFrame()
-
-    return prices, failed
-
+# ----------------------------
 
 def compute_geo_pak(price_series, window=260):
-    """Berechne GeoPAK10 (geometrisches Mittel der letzten 10 Jahresrenditen)."""
+    """Berechne GeoPAK10 (geometrisches Mittel der letzten 10 Jahre, als %)."""
     if len(price_series.dropna()) < window:
         return np.nan
     returns = []
@@ -69,7 +25,8 @@ def compute_geo_pak(price_series, window=260):
             continue
     if not returns:
         return np.nan
-    return np.prod([(1 + r) for r in returns]) ** (1 / len(returns)) - 1
+    geo = np.prod([(1 + r) for r in returns]) ** (1 / len(returns)) - 1
+    return geo * 100  # Prozent
 
 
 def compute_verlust_ratio(price_series):
@@ -81,24 +38,17 @@ def compute_verlust_ratio(price_series):
     up = (price_series / price_series.cummin() - 1).max()
     if up == 0:
         return np.nan
-    return dd / up
+    return abs(dd) / up  # positiv
 
 
-def compute_gewinn_konstanz(price_series, window=260):
-    """Berechne Gewinnkonstanz (Prozentsatz positiver Jahre)."""
-    if len(price_series) < window:
+def compute_gewinn_konstanz(price_series):
+    """Berechne Gewinnkonstanz = % positiver Jahre."""
+    if price_series.empty:
         return np.nan
-    years = []
-    for i in range(1, 11):
-        try:
-            start = price_series.iloc[-(i * window)]
-            end = price_series.iloc[-((i - 1) * window + 1)]
-            years.append(1 if end > start else 0)
-        except Exception:
-            continue
-    if not years:
+    yearly = price_series.resample("Y").last().pct_change().dropna()
+    if yearly.empty:
         return np.nan
-    return np.mean(years) * 100
+    return (yearly > 0).mean() * 100
 
 
 def compute_sicherheitsscore(geo, vr, gk):
@@ -109,84 +59,80 @@ def compute_sicherheitsscore(geo, vr, gk):
         return np.nan
 
 
-# ------------------------------------------------------
-# UI
-# ------------------------------------------------------
+def fetch_prices(tickers, start="2010-01-01"):
+    """Lade Preisdaten via yfinance."""
+    try:
+        data = yf.download(tickers, start=start, auto_adjust=True, progress=False)
+        if isinstance(data.columns, pd.MultiIndex):
+            data = data["Close"]
+        return data
+    except Exception as e:
+        st.error(f"Fehler beim Laden der Kursdaten: {e}")
+        return pd.DataFrame()
 
-st.title("🏆 Champions Auswahl – GeoPAK10 + Buffett-Kriterien")
 
-uploaded = st.file_uploader("CSV mit Champions (Ticker, Name)", type=["csv"])
-if uploaded is None:
-    st.info("Bitte CSV mit mindestens den Spalten **Ticker** und **Name** hochladen.")
-    st.stop()
+# ----------------------------
+# Streamlit Oberfläche
+# ----------------------------
 
-try:
-    df_in = pd.read_csv(uploaded)
-    tickers = df_in["Ticker"].astype(str).str.upper().tolist()
-    name_map = dict(zip(df_in["Ticker"], df_in["Name"]))
-    st.success(f"{len(tickers)} Champions eingelesen.")
-except Exception as e:
-    st.error(f"Fehler beim Einlesen der CSV: {e}")
-    st.stop()
+st.title("🏆 Champions Analyse – GeoPAK10 & Buffett-Kriterien")
 
-start_date = datetime.today() - timedelta(days=365*10)
-end_date = datetime.today()
+uploaded = st.file_uploader("📂 CSV mit Champions (Ticker, Name)", type=["csv"])
 
-with st.spinner("Lade Kursdaten (Batchweise mit Pausen)…"):
-    prices, failed = fetch_ohlc_safe(tickers, start_date, end_date)
+if uploaded:
+    try:
+        df_in = pd.read_csv(uploaded)
+        if "Ticker" not in df_in.columns:
+            st.error("Die CSV muss mindestens eine Spalte 'Ticker' enthalten.")
+            st.stop()
+    except Exception as e:
+        st.error(f"CSV konnte nicht gelesen werden: {e}")
+        st.stop()
 
-if prices.empty:
-    st.error("Keine Kursdaten geladen.")
-    st.stop()
+    tickers = df_in["Ticker"].dropna().astype(str).tolist()
+    names = dict(zip(df_in["Ticker"], df_in.get("Name", df_in["Ticker"])))
 
-if failed:
-    st.warning(f"{len(failed)} Ticker konnten nicht geladen werden: {failed}")
+    st.info(f"{len(tickers)}/100 Champions ausgelesen.")
 
-# ------------------------------------------------------
-# Berechnungen
-# ------------------------------------------------------
+    with st.spinner("Lade Kursdaten von Yahoo Finance …"):
+        prices = fetch_prices(tickers, start="2010-01-01")
 
-results = []
-for t in prices.columns:
-    s = prices[t].dropna()
-    if s.empty:
-        continue
-    geo = compute_geo_pak(s)
-    vr = compute_verlust_ratio(s)
-    gk = compute_gewinn_konstanz(s)
-    score = compute_sicherheitsscore(geo, vr, gk)
+    results = []
+    for t in tickers:
+        if t not in prices.columns:
+            continue
+        s = prices[t].dropna()
+        if s.empty:
+            continue
 
-    # Buffett-Kriterien
-    unterbewertet = "Ja" if score is not None and score >= 6 else "Nein"
-    buffett_signal = "Ja" if unterbewertet == "Ja" else "Nein"
+        geo = compute_geo_pak(s)
+        vr = compute_verlust_ratio(s)
+        gk = compute_gewinn_konstanz(s)
+        score = compute_sicherheitsscore(geo, vr, gk)
 
-    results.append({
-        "Ticker": t,
-        "Name": name_map.get(t, t),
-        "GeoPAK10": round(geo, 3) if geo is not None else np.nan,
-        "Verlust-Ratio": round(vr, 3) if vr is not None else np.nan,
-        "Gewinnkonstanz": round(gk, 1) if gk is not None else np.nan,
-        "Sicherheitsscore": round(score, 3) if score is not None else np.nan,
-        "Unterbewertung": unterbewertet,
-        "Buffett-Signal": buffett_signal,
-    })
+        results.append({
+            "Ticker": t,
+            "Name": names.get(t, t),
+            "Kurs aktuell": round(s.iloc[-1], 2),
+            "GeoPAK10 (%)": round(geo, 2) if pd.notna(geo) else np.nan,
+            "Verlust-Ratio": round(vr, 2) if pd.notna(vr) else np.nan,
+            "Gewinnkonstanz (%)": round(gk, 1) if pd.notna(gk) else np.nan,
+            "Sicherheitsscore": round(score, 3) if pd.notna(score) else np.nan,
+        })
 
-df = pd.DataFrame(results)
-if df.empty:
-    st.warning("Keine Kennzahlen berechnet.")
-    st.stop()
+    df = pd.DataFrame(results)
 
-df = df.sort_values("Sicherheitsscore", ascending=False).reset_index(drop=True)
-df["Rank"] = np.arange(1, len(df) + 1)
+    if df.empty:
+        st.warning("Keine Kennzahlen berechnet – evtl. keine Kursdaten?")
+        st.stop()
 
-# ------------------------------------------------------
-# Ausgabe
-# ------------------------------------------------------
+    df = df.sort_values("Sicherheitsscore", ascending=False).reset_index(drop=True)
+    df["Rank"] = df.index + 1
 
-st.subheader("Ranking – Champions")
-st.dataframe(df, use_container_width=True)
+    st.subheader("📊 Ergebnisse")
+    st.dataframe(df, use_container_width=True)
 
-st.download_button("📥 Ergebnisse als CSV", df.to_csv(index=False).encode("utf-8"),
-                   "champions_scores.csv", "text/csv")
+    st.download_button("📥 Ergebnisse als CSV", df.to_csv(index=False).encode("utf-8"), "champions_scores.csv", "text/csv")
 
-st.caption("Nur Informations- und Ausbildungszwecke. Keine Anlageempfehlung.")
+else:
+    st.info("Bitte eine CSV-Datei mit den Champions hochladen.")
